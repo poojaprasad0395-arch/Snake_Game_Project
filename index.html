@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Babylon.js 3D Snake — Bounded Arena</title>
+  <style>
+    html,body { width:100%; height:100%; margin:0; padding:0; overflow:hidden; font-family: Arial, Helvetica, sans-serif }
+    #renderCanvas { width:100%; height:100%; touch-action:none; display:block }
+    #hud {
+      position: absolute; left: 12px; top: 12px; color: #fff;
+      background: rgba(0,0,0,0.35); padding: 10px 12px; border-radius: 8px;
+    }
+    #instructions { position: absolute; right: 12px; top: 12px; color:#fff; background: rgba(0,0,0,0.28); padding:10px; border-radius:8px; max-width:320px }
+  </style>
+</head>
+<body>
+  <canvas id="renderCanvas"></canvas>
+  <div id="hud">Score: <span id="score">0</span></div>
+  <div id="instructions">
+    <b>Controls</b><br>
+    Turns the snake left/right — A/D<br>
+    Pitches Sname up/down — Press W/S
+    R — reset
+    <hr style="opacity:0.25">
+    Smooth continuous movement. Eat food to grow.
+  </div>
+
+  <script src="https://cdn.babylonjs.com/babylon.js"></script>
+  <script>
+    // Basic Babylon.js snake game in a bounded cube arena
+    const canvas = document.getElementById('renderCanvas');
+    const engine = new BABYLON.Engine(canvas, true, {preserveDrawingBuffer:true, stenciling:true});
+
+    const createScene = function() {
+      const scene = new BABYLON.Scene(engine);
+      scene.clearColor = new BABYLON.Color3(0.06, 0.08, 0.12);
+
+      // Camera — ArcRotate to give an overview while following the snake head
+      const camera = new BABYLON.ArcRotateCamera('cam', -Math.PI/2.8, Math.PI/3.6, 30, new BABYLON.Vector3(0,4,0), scene);
+      camera.attachControl(canvas, true);
+      camera.lowerRadiusLimit = 10;
+      camera.upperRadiusLimit = 70;
+
+      // Lights
+      const hemi = new BABYLON.HemisphericLight('hemi', new BABYLON.Vector3(0.5, 1, 0.5), scene);
+      hemi.intensity = 0.6;
+      const dir = new BABYLON.DirectionalLight('dir', new BABYLON.Vector3(-0.3, -1, 0.4), scene);
+      dir.position = new BABYLON.Vector3(30, 40, -20);
+      dir.intensity = 0.6;
+
+      // Arena bounds (cube room)
+      const BOUNDS = 18; // half-extent
+      const wallMat = new BABYLON.StandardMaterial('wallMat', scene);
+      wallMat.alpha = 0.18; wallMat.diffuseColor = new BABYLON.Color3(0.9, 0.9, 1);
+
+      // Floor
+      const floor = BABYLON.MeshBuilder.CreateGround('floor', {width: BOUNDS*2, height: BOUNDS*2}, scene);
+      const floorMat = new BABYLON.StandardMaterial('floorMat', scene);
+      floorMat.diffuseColor = new BABYLON.Color3(0.08,0.1,0.12);
+      floor.material = floorMat;
+
+      // Four walls (slightly inset so snake can't cross)
+      const wallThickness = 0.5;
+      const wallHeight = 10;
+      const createWall = (name, pos, rot, dims) => {
+        const w = BABYLON.MeshBuilder.CreateBox(name, {width:dims[0], height:dims[1], depth:dims[2]}, scene);
+        w.position = pos;
+        w.rotation = rot;
+        w.material = wallMat;
+        w.isPickable = false;
+        return w;
+      }
+      createWall('wallXpos', new BABYLON.Vector3(BOUNDS+wallThickness/2, wallHeight/2 - 1, 0), new BABYLON.Vector3(0,0,0), [wallThickness, wallHeight, BOUNDS*2+wallThickness]);
+      createWall('wallXneg', new BABYLON.Vector3(-BOUNDS-wallThickness/2, wallHeight/2 - 1, 0), new BABYLON.Vector3(0,0,0), [wallThickness, wallHeight, BOUNDS*2+wallThickness]);
+      createWall('wallZpos', new BABYLON.Vector3(0, wallHeight/2 - 1, BOUNDS+wallThickness/2), new BABYLON.Vector3(0,0,0), [BOUNDS*2+wallThickness, wallHeight, wallThickness]);
+      createWall('wallZneg', new BABYLON.Vector3(0, wallHeight/2 - 1, -BOUNDS-wallThickness/2), new BABYLON.Vector3(0,0,0), [BOUNDS*2+wallThickness, wallHeight, wallThickness]);
+
+      // Ceiling subtle
+      const ceiling = BABYLON.MeshBuilder.CreateGround('ceiling', {width: BOUNDS*2, height: BOUNDS*2}, scene);
+      ceiling.position = new BABYLON.Vector3(0, wallHeight - 2, 0);
+      ceiling.rotation.x = Math.PI;
+      ceiling.material = wallMat;
+
+      // Visual boundary box (wireframe)
+      const box = BABYLON.MeshBuilder.CreateBox('bounds', {size: BOUNDS*2}, scene);
+      const boundsMat = new BABYLON.StandardMaterial('boundsMat', scene);
+      boundsMat.emissiveColor = new BABYLON.Color3(0.2,0.6,1);
+      boundsMat.alpha = 0.06;
+      box.material = boundsMat;
+      box.isVisible = false; // keep invisible; walls themselves show boundaries
+
+      // Snake head
+      const headMat = new BABYLON.StandardMaterial('headMat', scene);
+      headMat.diffuseColor = new BABYLON.Color3(0.9, 0.35, 0.25);
+      const head = BABYLON.MeshBuilder.CreateSphere('head', {diameter: 1.1, segments: 16}, scene);
+      head.material = headMat;
+      head.position = new BABYLON.Vector3(0, 1, 0);
+
+      // Snake body segments array
+      const segmentMat = new BABYLON.StandardMaterial('segMat', scene);
+      segmentMat.diffuseColor = new BABYLON.Color3(0.9,0.6,0.35);
+      const segments = [];
+
+      // Parameters
+      let score = 0;
+      const scoreEl = document.getElementById('score');
+
+      const speed = 6.0; // units per second
+      const turnSpeed = 2.2; // radians per second for heading adjustments
+      const verticalSpeed = 3.0; // for upward/downward control
+
+      // Input state
+      const input = {left:false, right:false, forward:false, back:false, up:false, down:false};
+      window.addEventListener('keydown', (e)=>{
+        if(e.key === 'a' || e.key === 'A') input.left = true;
+        if(e.key === 'd' || e.key === 'D') input.right = true;
+        if(e.key === 'w' || e.key === 'W') input.forward = true;
+        if(e.key === 's' || e.key === 'S') input.back = true;
+        if(e.key === 'q' || e.key === 'Q') input.up = true;
+        if(e.key === 'e' || e.key === 'E') input.down = true;
+        if(e.key === 'r' || e.key === 'R') resetGame();
+      });
+      window.addEventListener('keyup', (e)=>{
+        if(e.key === 'a' || e.key === 'A') input.left = false;
+        if(e.key === 'd' || e.key === 'D') input.right = false;
+        if(e.key === 'w' || e.key === 'W') input.forward = false;
+        if(e.key === 's' || e.key === 'S') input.back = false;
+        if(e.key === 'q' || e.key === 'Q') input.up = false;
+        if(e.key === 'e' || e.key === 'E') input.down = false;
+      });
+
+      // Movement state: heading is a unit vector that points forward on X/Z plane and includes Y
+      let heading = new BABYLON.Vector3(0,0,1); // initial forward
+      let upDownVel = 0; // for smooth Y control
+
+      // Path history approach for smooth following
+      const pathHistory = []; // Array of Vector3 positions of the head each frame
+      const maxHistory = 2000;
+      const spacingFrames = 8; // how many frames between visible segments — adjust to change spacing
+
+      // Food
+      let food = null;
+      const foodMat = new BABYLON.StandardMaterial('foodMat', scene);
+      foodMat.diffuseColor = new BABYLON.Color3(0.16, 0.9, 0.4);
+      foodMat.emissiveColor = new BABYLON.Color3(0.1, 0.6, 0.2);
+
+      function spawnFood() {
+        if(food) food.dispose();
+        // ensure spawn within [-BOUNDS+2 .. BOUNDS-2] and not too close to snake head
+        const margin = 2.4;
+        let tries = 0;
+        while(true) {
+          const x = (Math.random()*2 - 1) * (BOUNDS - margin);
+          const z = (Math.random()*2 - 1) * (BOUNDS - margin);
+          const y = 1 + (Math.random()* (Math.min(3, wallHeight-4)) );
+          const pos = new BABYLON.Vector3(x,y,z);
+          if(pos.subtract(head.position).length() > 3 || tries++>30) {
+            food = BABYLON.MeshBuilder.CreateSphere('food', {diameter:0.9}, scene);
+            food.position = pos;
+            food.material = foodMat;
+            break;
+          }
+        }
+      }
+
+      spawnFood();
+
+      // Utility: add one segment at tail
+      function addSegment() {
+        const seg = BABYLON.MeshBuilder.CreateSphere('seg' + segments.length, {diameter:0.95, segments:12}, scene);
+        seg.material = segmentMat;
+        // place it roughly at head
+        seg.position = head.position.clone();
+        segments.push(seg);
+      }
+
+      // Start with 6 segments
+      for(let i=0;i<6;i++) addSegment();
+
+      // Reset game
+      function resetGame(){
+        // dispose segments
+        segments.forEach(s=>s.dispose());
+        segments.length = 0;
+        for(let i=0;i<6;i++) addSegment();
+        head.position = new BABYLON.Vector3(0,1,0);
+        heading = new BABYLON.Vector3(0,0,1);
+        pathHistory.length = 0;
+        score = 0; scoreEl.textContent = score;
+        if(food) { food.dispose(); food = null }
+        spawnFood();
+      }
+
+      // Collision with walls
+      function checkWallCollision(pos) {
+        if(Math.abs(pos.x) > BOUNDS - 0.5 || pos.y < 0.3 || pos.y > wallHeight - 2.5 || Math.abs(pos.z) > BOUNDS - 0.5) return true;
+        return false;
+      }
+
+      // Main update loop
+      let last = performance.now();
+      // Define angles outside the loop
+let yaw = 0;   // horizontal rotation
+let pitch = 0; // vertical tilt
+      scene.onBeforeRenderObservable.add(() => {
+  const now = performance.now();
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+
+  // Adjust yaw & pitch based on input
+  const turnRate = 1.8;   // radians per second
+  const pitchRate = 1.2;  // radians per second
+
+  if (input.left)  yaw += turnRate * dt;
+  if (input.right) yaw -= turnRate * dt;
+  if (input.forward) pitch += pitchRate * dt;
+  if (input.back)    pitch -= pitchRate * dt;
+
+  // Clamp pitch so snake doesn’t flip upside down
+  pitch = BABYLON.Scalar.Clamp(pitch, -Math.PI/4, Math.PI/4);
+
+  // Compute heading from yaw & pitch
+  heading.x = Math.sin(yaw) * Math.cos(pitch);
+  heading.y = Math.sin(pitch);
+  heading.z = Math.cos(yaw) * Math.cos(pitch);
+  heading.normalize();
+
+  // Move head forward
+  const move = heading.scale(speed * dt);
+  head.position.addInPlace(move);
+
+  // Add path history for body segments
+  pathHistory.push(head.position.clone());
+  if (pathHistory.length > maxHistory) pathHistory.shift();
+
+  for (let i = 0; i < segments.length; i++) {
+    const idx = Math.max(0, pathHistory.length - 1 - (i + 1) * spacingFrames);
+    const targetPos = pathHistory[idx] || head.position;
+    segments[i].position = BABYLON.Vector3.Lerp(segments[i].position, targetPos, 0.55);
+  }
+
+  // Camera follow
+  const camTarget = BABYLON.Vector3.Lerp(camera.target, head.position.add(new BABYLON.Vector3(0,1,0)), 0.15);
+  camera.setTarget(camTarget);
+
+  // Check food collision
+  if (food && head.position.subtract(food.position).length() < 1.2) {
+    food.dispose(); food = null;
+    score += 1; scoreEl.textContent = score;
+    addSegment();
+    spawnFood();
+  }
+
+  // Check wall collision
+  if (checkWallCollision(head.position)) {
+    resetGame();
+  }
+});
+
+      return scene;
+    }
+
+    const scene = createScene();
+    engine.runRenderLoop(()=>{ scene.render(); });
+    window.addEventListener('resize', ()=>{ engine.resize(); });
+  </script>
+</body>
+</html>
